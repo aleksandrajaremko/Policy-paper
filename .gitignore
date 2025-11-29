@@ -1,6 +1,7 @@
 
 # custom folders
 data/inputs/
+keys
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
