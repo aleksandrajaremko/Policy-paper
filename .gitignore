@@ -1,6 +1,7 @@
 
 # custom folders
 data/inputs/
+data/outputs/
 keys
 
 # Byte-compiled / optimized / DLL files
