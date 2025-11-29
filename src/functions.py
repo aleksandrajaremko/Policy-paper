@@ -36,44 +36,55 @@ def clean_english_colnames(df, normalize='keep'):
     return df2
 
 
-
-def extract_woj_pow(location_str):
+def parse_location_string(location_str):
     """
-    Extract WOJ and POW pairs from a location string.
-    Handles format: "WOJ.: NAME, POW.: NAME | WOJ.: NAME, POW.: NAME"
-    Returns a list of dicts with 'woj' and 'pow' keys.
-    Example: "WOJ.: LUBUSKIE, POW.: Gorzów Wielkopolski" 
-             -> [{'woj': 'LUBUSKIE', 'pow': 'Gorzów Wielkopolski'}]
+    Parses a complex location string into a list of location dictionaries.
+    Handles multiple locations separated by '|'.
+    Extracts 'woj', 'pow', and 'gmina' components.
+
+    Returns: A list of dictionaries, e.g., [{'woj': 'MAZOWIECKIE', 'pow': 'warszawski'}].
     """
     if pd.isna(location_str):
         return []
-    
-    location_str = str(location_str).strip()
-    pairs = []
-    
-    # Split by | to handle multiple locations
-    locations = location_str.split('|')
-    
-    for loc in locations:
-        loc = loc.strip()
-        
-        # Find WOJ value (text after "WOJ.:" up to comma)
-        woj_match = re.search(r'WOJ\.\s*:\s*([^,]+)', loc, re.IGNORECASE)
-        # Find POW value (text after "POW.:" to end of string or next |)
-        pow_match = re.search(r'POW\.\s*:\s*([^|]+)', loc, re.IGNORECASE)
-        
-        woj = woj_match.group(1).strip() if woj_match else None
-        pow = pow_match.group(1).strip() if pow_match else None
-        
-        if woj or pow:
-            pairs.append({'woj': woj, 'pow': pow})
-    
-    return pairs
+
+    def clean_component(text):
+        if not text:
+            return None
+        # Remove labels like "WOJ.:", "POW. :", "GM ", etc.
+        text = re.sub(r'^\s*(WOJ|POW|GM)[\s.:-]*', '', text, flags=re.IGNORECASE)
+        # Remove trailing descriptions like " - gmina wiejska"
+        text = re.sub(r'\s*-\s*gmina.*$', '', text, flags=re.IGNORECASE)
+        return text.strip()
+
+    parsed_locations = []
+    segments = str(location_str).split('|')
+
+    for segment in segments:
+        if not segment.strip():
+            continue
+
+        # Use regex to find all potential components, tolerant of missing commas
+        woj_match = re.search(r'WOJ[\s.:-]*([^\,\|]+)', segment, re.IGNORECASE)
+        pow_match = re.search(r'POW[\s.:-]*([^\,\|]+)', segment, re.IGNORECASE)
+        gmina_match = re.search(r'GM[\s.:-]*([^\,\|]+)', segment, re.IGNORECASE)
+
+        woj = clean_component(woj_match.group(1)) if woj_match else None
+        powiat = clean_component(pow_match.group(1)) if pow_match else None
+        gmina = clean_component(gmina_match.group(1)) if gmina_match else None
+
+        # If any component is found, add it to the list
+        if woj or powiat or gmina:
+            parsed_locations.append({'woj': woj, 'pow': powiat, 'gmina': gmina})
+
+    return parsed_locations
+
 
 def split_funding_by_locations(df, location_col, funding_col):
     """Split funding equally across multiple locations."""
     df = df.copy()
-    df['num_locations'] = df[location_col].apply(lambda x: len(extract_woj_pow(x)))
+    # Use the new robust parsing function
+    df['parsed_locations'] = df[location_col].apply(parse_location_string)
+    df['num_locations'] = df['parsed_locations'].apply(len)
     df['funding_per_location'] = df.apply(
         lambda row: row[funding_col] / row['num_locations'] if row['num_locations'] > 0 else row[funding_col],
         axis=1
@@ -140,7 +151,7 @@ def flag_projects_country(df, location_col="Project location", project_id_col=No
     countries_list = []
     for _, r in df.iterrows():
         loc = r.get(location_col, "")
-        pairs = extract_woj_pow(loc)
+        pairs = parse_location_string(loc)
         is_pol, countries = detect_poland_for_pairs(pairs, location_text=loc)
         is_poland_list.append(is_pol)
         countries_list.append(";".join(sorted(countries)))
@@ -171,7 +182,7 @@ def unnest_locations(df, location_col, funding_col, project_id_col=None):
     """
     rows = []
     for _, r in df.iterrows():
-        pairs = extract_woj_pow(r.get(location_col))
+        pairs = parse_location_string(r.get(location_col))
         # robust parse of funding value
         total_raw = r.get(funding_col)
         total_num = 0.0
@@ -198,9 +209,13 @@ def unnest_locations(df, location_col, funding_col, project_id_col=None):
             for p in pairs:
                 new = r.to_dict()            # preserve all original columns
                 # set standardized location text for the single pair
-                new[location_col] = f"WOJ.: {p.get('woj')}, POW.: {p.get('pow')}"
+                loc_parts = []
+                if p.get('woj'): loc_parts.append(f"WOJ.: {p.get('woj')}")
+                if p.get('pow'): loc_parts.append(f"POW.: {p.get('pow')}")
+                if p.get('gmina'): loc_parts.append(f"GM.: {p.get('gmina')}")
+                new[location_col] = ", ".join(loc_parts)
                 new['woj'] = p.get('woj')
-                new['pow'] = p.get('pow')
+                new['pow'] = p.get('pow') # Retain 'pow' for backward compatibility if needed
                 new['funding_split'] = split
                 rows.append(new)
             # important: do NOT append the original multi-location row
@@ -209,6 +224,7 @@ def unnest_locations(df, location_col, funding_col, project_id_col=None):
             new = r.to_dict()
             new['woj'] = None
             new['pow'] = None
+            new['gmina'] = None
             new['funding_split'] = total_num
             rows.append(new)
 
@@ -377,3 +393,31 @@ def add_iso3_column(df):
 
     df['iso3'] = df.apply(_infer_iso, axis=1)
     return df
+
+def standardize_polish_name(name):
+    """
+    Standardizes Polish administrative unit names for merging.
+    - Normalizes Polish characters (diacritics).
+    - Lowercases and removes common prefixes like 'powiat', 'm.', 'gmina'.
+    - Trims whitespace.
+    - Handles 'm. st. warszawa'.
+    """
+    if pd.isna(name):
+        return None
+    
+    # Lowercase and strip
+    s = str(name).lower().strip()
+
+    # Normalize Polish characters (e.g., 'ł' -> 'l', 'ą' -> 'a')
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('utf-8')
+
+    # Handle special cases like 'm. st. warszawa'
+    s = re.sub(r'^m\.\s*st\.\s+', '', s)
+
+    # Remove common prefixes
+    s = re.sub(r'^(powiat|gmina|m\.)\s+', '', s)
+
+    # Remove any remaining non-alphanumeric characters except spaces
+    s = re.sub(r'[^a-z0-9\s]', '', s)
+
+    return ' '.join(s.split()) # Normalize whitespace
