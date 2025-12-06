@@ -1,6 +1,29 @@
 import re 
 import pandas as pd
 import unicodedata
+import glob
+
+OFFICIAL_POWIAT_COUNT = {
+    'dolnoslaskie': 30,
+    'kujawsko-pomorskie': 23,
+    'lubelskie': 24,
+    'lubuskie': 13,
+    'lodzkie': 24,
+    'malopolskie': 22,
+    'mazowieckie': 42,
+    'opolskie': 12,
+    'podkarpackie': 18,
+    'podlaskie': 17,
+    'pomorskie': 20,
+    'slaskie': 40,
+    'swietokrzyskie': 14,
+    'warminsko-mazurskie': 22,
+    'wielkopolskie': 34,
+    'zachodniopomorskie': 18,
+}
+
+
+############## DATA CLEANING FUNCTIONS #####################
 
 def clean_english_colnames(df, normalize='keep'):
     """
@@ -35,365 +58,6 @@ def clean_english_colnames(df, normalize='keep'):
     df2.columns = final
     return df2
 
-
-def parse_location_string(location_str):
-    """
-    Parses a complex location string into a list of location dictionaries.
-    Handles multiple locations separated by '|'.
-    Extracts 'woj', 'pow', and 'gmina' components.
-
-    Returns: A list of dictionaries, e.g., [{'woj': 'MAZOWIECKIE', 'pow': 'warszawski'}].
-    """
-    if pd.isna(location_str):
-        return []
-
-    def clean_component(text):
-        if not text:
-            return None
-        # Remove labels like "WOJ.:", "POW. :", "GM ", etc.
-        text = re.sub(r'^\s*(WOJ|POW|GM)[\s.:-]*', '', text, flags=re.IGNORECASE)
-        # Remove trailing descriptions like " - gmina wiejska"
-        text = re.sub(r'\s*-\s*gmina.*$', '', text, flags=re.IGNORECASE)
-        return text.strip()
-
-    parsed_locations = []
-    segments = str(location_str).split('|')
-
-    for segment in segments:
-        if not segment.strip():
-            continue
-
-        # Use regex to find all potential components, tolerant of missing commas
-        woj_match = re.search(r'WOJ[\s.:-]*([^\,\|]+)', segment, re.IGNORECASE)
-        pow_match = re.search(r'POW[\s.:-]*([^\,\|]+)', segment, re.IGNORECASE)
-        gmina_match = re.search(r'GM[\s.:-]*([^\,\|]+)', segment, re.IGNORECASE)
-
-        woj = clean_component(woj_match.group(1)) if woj_match else None
-        powiat = clean_component(pow_match.group(1)) if pow_match else None
-        gmina = clean_component(gmina_match.group(1)) if gmina_match else None
-
-        # If any component is found, add it to the list
-        if woj or powiat or gmina:
-            parsed_locations.append({'woj': woj, 'pow': powiat, 'gmina': gmina})
-
-    return parsed_locations
-
-
-def split_funding_by_locations(df, location_col, funding_col):
-    """Split funding equally across multiple locations."""
-    df = df.copy()
-    # Use the new robust parsing function
-    df['parsed_locations'] = df[location_col].apply(parse_location_string)
-    df['num_locations'] = df['parsed_locations'].apply(len)
-    df['funding_per_location'] = df.apply(
-        lambda row: row[funding_col] / row['num_locations'] if row['num_locations'] > 0 else row[funding_col],
-        axis=1
-    )
-    return df
-
-
-
-_POLISH_VOIVODES = [
-    "Dolnośląskie", "Kujawsko-pomorskie", "Lubelskie", "Lubuskie", "Łódzkie",
-    "Małopolskie", "Mazowieckie", "Opolskie", "Podkarpackie", "Podlaskie",
-    "Pomorskie", "Śląskie", "Świętokrzyskie", "Warmińsko-mazurskie",
-    "Wielkopolskie", "Zachodniopomorskie"
-]
-def _norm_name(s):
-    if not s:
-        return ""
-    s = str(s).strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s
-
-_POLISH_VOIVODES_N = set(_norm_name(v) for v in _POLISH_VOIVODES)
-
-def is_polish_voivodeship(name):
-    """Return True if name matches a Polish voivodeship (robust to case/diacritics)."""
-    return _norm_name(name) in _POLISH_VOIVODES_N
-
-def detect_poland_for_pairs(pairs, location_text=None):
-    """
-    Given a list of {'woj','pow'} pairs return:
-      - is_poland: True if all pairs point to Poland (woj in Polish voivodeships)
-      - countries_seen: set of detected countries ('Poland' and/or 'Other')
-    Fallback: if pairs empty, inspect raw location_text for 'Poland'/'Polska'.
-    """
-    countries = set()
-    if pairs:
-        for p in pairs:
-            woj = p.get("woj")
-            if woj and is_polish_voivodeship(woj):
-                countries.add("Poland")
-            else:
-                countries.add("Other")
-    else:
-        txt = (location_text or "") .lower()
-        if "polska" in txt or "poland" in txt:
-            countries.add("Poland")
-        elif txt.strip() == "":
-            countries.add("Unknown")
-        else:
-            countries.add("Other")
-    is_poland = (len(countries) == 1 and "Poland" in countries)
-    return is_poland, countries
-
-def flag_projects_country(df, location_col="Project location", project_id_col=None):
-    """
-    Add row-level 'is_poland_location' (bool) and 'countries_seen' (str list),
-    and project-level 'project_country_status' if project_id_col provided.
-
-    project_country_status values: 'all_poland', 'crossborder', 'no_poland'
-    """
-    df = df.copy()
-    is_poland_list = []
-    countries_list = []
-    for _, r in df.iterrows():
-        loc = r.get(location_col, "")
-        pairs = parse_location_string(loc)
-        is_pol, countries = detect_poland_for_pairs(pairs, location_text=loc)
-        is_poland_list.append(is_pol)
-        countries_list.append(";".join(sorted(countries)))
-    df["is_poland_location"] = is_poland_list
-    df["countries_seen"] = countries_list
-
-    if project_id_col and project_id_col in df.columns:
-        # determine project-level status
-        grp = df.groupby(project_id_col)["is_poland_location"]
-        def _status(x):
-            if x.all():
-                return "all_poland"
-            if x.any() and not x.all():
-                return "crossborder"
-            return "no_poland"
-        proj_status = grp.apply(_status).rename("project_country_status").reset_index()
-        df = df.merge(proj_status, on=project_id_col, how="left")
-    return df
-
-def unnest_locations(df, location_col, funding_col, project_id_col=None):
-    """
-    Return DataFrame with one row per WOJ-POW pair.
-    - preserves all original columns by converting each row to dict()
-    - replaces location_col with the specific "WOJ.: ..., POW.: ..." string for that row
-    - adds 'woj', 'pow' and 'funding_split' columns
-    - If a row has multiple locations, the original multi-location row is NOT kept.
-    - If a row has exactly one location, it becomes a single standardized row.
-    """
-    rows = []
-    for _, r in df.iterrows():
-        pairs = parse_location_string(r.get(location_col))
-        # robust parse of funding value
-        total_raw = r.get(funding_col)
-        total_num = 0.0
-        if pd.notna(total_raw):
-            try:
-                if isinstance(total_raw, str):
-                    s = total_raw.replace('\xa0', ' ').strip()
-                    s = re.sub(r'[^\d\-\.,]', '', s)
-                    s = s.replace(' ', '')
-                    if ',' in s and '.' in s:
-                        s = s.replace(',', '')
-                    elif ',' in s and '.' not in s:
-                        s = s.replace(',', '.')
-                    total_num = float(s) if s not in ('', '.', '-') else 0.0
-                else:
-                    total_num = float(total_raw)
-            except Exception:
-                total_num = 0.0
-
-        n = len(pairs)
-        if n > 0:
-            # compute split: if single location keep full amount; if multiple divide equally
-            split = total_num if n == 1 else (total_num / n if n else total_num)
-            for p in pairs:
-                new = r.to_dict()            # preserve all original columns
-                # set standardized location text for the single pair
-                loc_parts = []
-                if p.get('woj'): loc_parts.append(f"WOJ.: {p.get('woj')}")
-                if p.get('pow'): loc_parts.append(f"POW.: {p.get('pow')}")
-                if p.get('gmina'): loc_parts.append(f"GM.: {p.get('gmina')}")
-                new[location_col] = ", ".join(loc_parts)
-                new['woj'] = p.get('woj')
-                new['pow'] = p.get('pow') # Retain 'pow' for backward compatibility if needed
-                new['funding_split'] = split
-                rows.append(new)
-            # important: do NOT append the original multi-location row
-        else:
-            # no parsed locations -> keep original row as-is but with funding_split parsed
-            new = r.to_dict()
-            new['woj'] = None
-            new['pow'] = None
-            new['gmina'] = None
-            new['funding_split'] = total_num
-            rows.append(new)
-
-    out = pd.DataFrame(rows)
-    # keep original column order + added cols at the end if not present
-    base_cols = list(df.columns)
-    for extra in ['woj', 'pow', 'funding_split']:
-        if extra not in base_cols:
-            base_cols.append(extra)
-    return out[base_cols]
-
-def unnest_locations_with_gmina(df, location_col, funding_col, project_id_col=None):
-    """
-    Unnest locations where multiple locations are separated by '|' and components
-    are labelled with WOJ / POW / GM (variants like 'WOJ.:', 'POW.:', 'GM.:' etc).
-    Returns original rows exploded into one row per segment with columns:
-    woj, pow, gmina, funding_split (funding divided equally across segments).
-    """
-    import re
-    import pandas as pd
-
-    def clean_component(s):
-        if s is None or (isinstance(s, float) and pd.isna(s)):
-            return None
-        s = str(s).strip()
-        # remove leading label variants (WOJ, POW, GM) with punctuation/space
-        s = re.sub(r'^\s*(?:WOJ|POW|GM)(?:[\.\:]{1,2})?\s*[:\.\-]*\s*', '', s, flags=re.I)
-        # remove trailing explanatory suffixes e.g. " - Gmina wiejska"
-        s = re.sub(r'\s*-\s*Gmina.*$', '', s, flags=re.I)
-        # trim leftover punctuation and whitespace
-        s = s.strip(" .,:;–—-")
-        return s if s != "" else None
-
-    rows = []
-    for _, row in df.iterrows():
-        loc_raw = row.get(location_col)
-        # parse funding numeric
-        total_raw = row.get(funding_col)
-        total_num = 0.0
-        if pd.notna(total_raw):
-            try:
-                if isinstance(total_raw, str):
-                    s = total_raw.replace('\xa0', ' ')
-                    s = re.sub(r'[^\d\-\.,]', '', s)
-                    s = s.replace(' ', '')
-                    if ',' in s and '.' in s:
-                        s = s.replace(',', '')
-                    elif ',' in s and '.' not in s:
-                        s = s.replace(',', '.')
-                    total_num = float(s) if s not in ('', '.', '-') else 0.0
-                else:
-                    total_num = float(total_raw)
-            except Exception:
-                total_num = 0.0
-
-        if pd.isna(loc_raw) or not isinstance(loc_raw, str) or loc_raw.strip() == "":
-            new = row.to_dict()
-            new.update({'woj': None, 'pow': None, 'gmina': None, 'funding_split': total_num})
-            rows.append(new)
-            continue
-
-        # split by '|' into segments (user guaranteed this separator)
-        segments = [seg.strip() for seg in loc_raw.split('|') if seg.strip()]
-        nseg = max(1, len(segments))
-        per_seg_fund = total_num / nseg if nseg > 0 else total_num
-
-        for seg in segments:
-            # split segment by commas (fields like "WOJ.: X, POW.: Y, GM.: Z")
-            parts = [p.strip() for p in re.split(r',\s*', seg) if p.strip()]
-            woj = None
-            pow_ = None
-            gmina = None
-            for p in parts:
-                pl = p.lower()
-                if pl.startswith('woj') or re.match(r'^\s*woj[\.\:]', pl):
-                    woj = clean_component(p)
-                    continue
-                if pl.startswith('pow') or re.match(r'^\s*pow[\.\:]', pl):
-                    pow_ = clean_component(p)
-                    continue
-                if pl.startswith('gm') or re.match(r'^\s*gm[\.\:]', pl):
-                    gmina = clean_component(p)
-                    continue
-                # fallback: if no explicit label but part looks like "POWNAME powiat" unlikely, skip
-
-            # If some labels weren't captured but the segment contains them without comma separation,
-            # try label searches across the whole segment (handles missing commas)
-            if not (woj or pow_ or gmina):
-                # search for labelled values anywhere
-                m_woj = re.search(r'WOJ[^\wÀ-ž]*([^\|,;]+)', seg, flags=re.I)
-                m_pow = re.search(r'POW[^\wÀ-ž]*([^\|,;]+)', seg, flags=re.I)
-                m_gm = re.search(r'GM[^\wÀ-ž]*([^\|,;]+)', seg, flags=re.I)
-                if m_woj:
-                    woj = clean_component(m_woj.group(1))
-                if m_pow:
-                    pow_ = clean_component(m_pow.group(1))
-                if m_gm:
-                    gmina = clean_component(m_gm.group(1))
-
-            new = row.to_dict()
-            # build standardized Project location string for this segment
-            parts_out = []
-            if woj:
-                parts_out.append(f"WOJ: {woj}")
-            if pow_:
-                parts_out.append(f"POW: {pow_}")
-            if gmina:
-                parts_out.append(f"GM: {gmina}")
-            new_loc = ", ".join(parts_out) if parts_out else seg
-            new[location_col] = new_loc
-            new['woj'] = woj
-            new['pow'] = pow_
-            new['gmina'] = gmina
-            new['funding_split'] = per_seg_fund
-            rows.append(new)
-
-    out = pd.DataFrame(rows)
-
-    # ensure added cols exist in output (keep original columns order + extras at end)
-    base_cols = list(df.columns)
-    for extra in ['woj', 'pow', 'gmina', 'funding_split']:
-        if extra not in base_cols:
-            base_cols.append(extra)
-    for c in base_cols:
-        if c not in out.columns:
-            out[c] = None
-
-    return out[base_cols]
-
-
-
-def add_iso3_column(df):
-    """
-    Add or infer iso3 column for location rows.
-    - Preserve existing iso3 values if present.
-    - Set 'POL' when woj matches a Polish voivodeship.
-    - Also set 'POL' when pow or gmina are present (covers woj+gmina without pow).
-    - If 'is_poland_location' column exists, use it as a fallback.
-    """
-    df = df.copy()
-    has_flag = 'is_poland_location' in df.columns
-
-    def _infer_iso(row):
-        # keep existing explicit iso3
-        existing = row.get('iso3', None)
-        if pd.notna(existing) and existing not in (None, ''):
-            return existing
-
-        woj = row.get('woj')
-        pow_ = row.get('pow')
-        gmina = row.get('gmina')
-
-        # if woj is a recognised Polish voivodeship -> POL
-        if woj and is_polish_voivodeship(woj):
-            return 'POL'
-
-        # if woj missing but pow or gmina present -> assume POL
-        if (pow_ and str(pow_).strip()) or (gmina and str(gmina).strip()):
-            return 'POL'
-
-        # fallback to project-level / row-level flag if available
-        if has_flag and row.get('is_poland_location') is True:
-            return 'POL'
-
-        return None
-
-    df['iso3'] = df.apply(_infer_iso, axis=1)
-    return df
-
 def standardize_polish_name(name):
     """
     Standardizes Polish administrative unit names for merging.
@@ -421,3 +85,433 @@ def standardize_polish_name(name):
     s = re.sub(r'[^a-z0-9\s]', '', s)
 
     return ' '.join(s.split()) # Normalize whitespace
+
+
+############## LOCATION EXTRACTION AND CLEANING #####################
+
+def extract_location_parts(series: pd.Series) -> pd.DataFrame:
+    """
+    Uses regex to extract WOJ, POW, and GMIN from a Series of location strings.
+
+    Args:
+        series (pd.Series): A pandas Series containing location strings.
+
+    Returns:
+        pd.DataFrame: A DataFrame with 'wojewodztwo', 'powiat', and 'gmina' columns.
+    """
+    # Define regex patterns for each part.
+    # The pattern looks for the keyword (e.g., "WOJ."), a colon, optional whitespace,
+    # and then captures all characters until it hits a comma or the end of the string.
+    patterns = {
+        'wojewodztwo': r'WOJ\.\s*:\s*([^,]+)',
+        'powiat':      r'POW\.\s*:\s*([^,]+)',
+        'gmina':       r'GMIN\.\s*:\s*([^,]+)'
+    }
+
+    # Apply .str.extract() for each pattern and combine the results.
+    # .extract() returns a DataFrame with the captured group.
+    # We use .get(0, default=pd.NA) to safely handle cases where a pattern is not found.
+    location_df = pd.DataFrame()
+    for col, pat in patterns.items():
+        # Extract returns a DataFrame; we want the first (and only) capture group.
+        extracted = series.str.extract(pat, expand=False)
+        location_df[col] = extracted.str.strip() # Clean up whitespace
+
+    return location_df
+
+
+def clean_extract_and_filter_locations(df: pd.DataFrame, location_col: str) -> pd.DataFrame:
+    """
+    Cleans, extracts location details, filters, and transforms a DataFrame.
+
+    This function will:
+    1. Split a location column by '|' and create new rows for each location.
+    2. Divide specified financial columns by the number of locations for that project.
+    3. Extract 'wojewodztwo', 'powiat', and 'gmina' into separate columns.
+    4. Filter out rows for non-Polish locations (containing 'oblast') or 'Cały Kraj'.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        location_col (str): The name of the column with pipe-separated locations.
+
+    Returns:
+        pd.DataFrame: A new, transformed and filtered DataFrame.
+    """
+    # --- 1. Identify Columns and Setup ---
+    cols_to_divide = [
+        'Total project value (PLN, for ETC projects EUR)',
+        'Total eligible expenditure (PLN, for ETC projects EUR)',
+        'Amount of EU co-financing (PLN, for ETC projects EUR)'
+    ]
+
+    # Validate that all necessary columns exist
+    for col in cols_to_divide + [location_col]:
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found in the DataFrame.")
+
+    df_processed = df.copy()
+
+    # --- 2. Split Locations and Calculate Divisor ---
+    df_processed['location_list'] = df_processed[location_col].str.split('|')
+    df_processed['location_count'] = df_processed['location_list'].apply(len)
+
+    # --- 3. Explode DataFrame ---
+    df_exploded = df_processed.explode('location_list')
+    
+    # Clean up the temporary location string
+    df_exploded['location_list'] = df_exploded['location_list'].str.strip()
+
+    # --- 4. Divide Financials (Done *before* filtering) ---
+    for col in cols_to_divide:
+        df_exploded[col] = pd.to_numeric(df_exploded[col], errors='coerce')
+        df_exploded.loc[:, col] = df_exploded[col] / df_exploded['location_count']
+
+    # --- 5. Extract Location Parts using the helper function ---
+    location_details = extract_location_parts(df_exploded['location_list'])
+    df_final = pd.concat([
+        df_exploded.reset_index(drop=True),
+        location_details.reset_index(drop=True)
+    ], axis=1)
+
+    # --- 6. Filter Out Unwanted Rows ---
+    # Condition 1: Location is 'Cały Kraj'
+    is_caly_kraj = df_final['location_list'] == 'Cały Kraj'
+
+    # Condition 2: Location is non-Polish (contains 'oblast')
+    non_polish_keywords = [
+        'oblast', 'Východné Slovensko', 'Stredné Slovensko', 'Sachsen',
+        'Lietuva', 'Mecklenburg-Vorpommern', 'Sydsverig', 'Sjalland',
+        'Smaland med öarna', 'Hovedstaden',  'Lviv', 'Lutsk', 'Görlitz', 'Ternopil', 'Klaipėdos apskritis','Uzhhorod',
+        'Bautzen','Rivne','Ivano-Frankivsk', 'Kovel', 'Østsjælland', 'Vest- og Sydsjælland', 'Mukachevo', 'Kalush',
+        'Chervonohrad', 'Khust', 'Sarny', 'Kalmar län', 'Volodymyr-Volynskyi', 'Drohobych', 'Chortkiv', 'Telšių apskritis',
+        'Nadvirna','Sambir','Varash','Kauno apskritis','Kronobergs län','Dubno','Yavoriv','Kremenets','Zolochiv','Berehiv',
+        'Stryi','Rakhiv','Tyachiv','Tauragės apskritis']
+    # Create a regex pattern by joining keywords with the OR operator '|'
+    regex_pattern = '|'.join(non_polish_keywords)
+    is_non_polish = df_final['location_list'].str.contains(
+        regex_pattern, case=False, na=False, regex=True
+    )
+
+    # Combine conditions and keep rows that are NOT unwanted
+    rows_to_keep = ~is_caly_kraj & ~is_non_polish
+    df_final = df_final[rows_to_keep].copy()
+
+    # --- 7. Final Cleanup ---
+    # Drop intermediate columns
+    df_final = df_final.drop(columns=[location_col, 'location_list', 'location_count'])
+
+    return df_final
+
+
+############# TREATMENT MATRIX #####################
+
+
+def create_treatment_matrix(cleaned_df: pd.DataFrame, geo_level: str = 'powiat') -> pd.DataFrame:
+    """
+    Aggregates cleaned project data to create a treatment matrix, distributing
+    voivodeship-level funds to their respective powiats.
+
+    Args:
+        cleaned_df (pd.DataFrame): The DataFrame after cleaning and exploding locations.
+        geo_level (str): The geographic level for aggregation. Currently, the
+                        distribution logic is implemented specifically for 'powiat'.
+
+    Returns:
+        pd.DataFrame: A DataFrame where each row is a unique geographic unit,
+                    with aggregated and distributed financial data.
+    """
+    if geo_level != 'powiat':
+        raise NotImplementedError("Distribution logic is currently only implemented for geo_level='powiat'.")
+
+    # --- Define official powiat counts per voivodeship as a source of truth ---
+    OFFICIAL_POWIAT_COUNT = {
+        'dolnoslaskie': 30,
+        'kujawsko-pomorskie': 23,
+        'lubelskie': 24,
+        'lubuskie': 14,
+        'lodzkie': 24,
+        'malopolskie': 22,
+        'mazowieckie': 42,
+        'opolskie': 12,
+        'podkarpackie': 25,
+        'podlaskie': 17,
+        'pomorskie': 20,
+        'slaskie': 36,
+        'swietokrzyskie': 14,
+        'warminsko-mazurskie': 21,
+        'wielkopolskie': 35,
+        'zachodniopomorskie': 21
+    }
+
+    # --- Define columns for aggregation ---
+    financial_cols = [
+        'Total project value (PLN, for ETC projects EUR)',
+        'Total eligible expenditure (PLN, for ETC projects EUR)',
+        'Amount of EU co-financing (PLN, for ETC projects EUR)'
+    ]
+    
+    rate_col = 'Union co-financing rate (%)'
+    cofinancing_val_col = 'Amount of EU co-financing (PLN, for ETC projects EUR)'
+
+    # --- 1. Standardize names for reliable grouping and joining ---
+    # Use a copy to avoid SettingWithCopyWarning
+    df = cleaned_df.copy()
+    df['wojewodztwo_std'] = df['wojewodztwo'].apply(standardize_polish_name)
+    df['powiat_std'] = df['powiat'].apply(standardize_polish_name)
+
+    # --- Prepare for Weighted Average Calculation ---
+    if rate_col in df.columns and cofinancing_val_col in df.columns:
+        df[rate_col] = pd.to_numeric(df[rate_col], errors='coerce')
+        # This column will be the numerator for the weighted average
+        df['rate_numerator'] = df[rate_col] * df[cofinancing_val_col]
+        # Add numerator to the list of financial columns to be summed
+        financial_cols_with_numerator = financial_cols + ['rate_numerator']
+    else:
+        financial_cols_with_numerator = financial_cols
+
+    # --- 2. Separate data into two groups ---
+    df_with_powiat = df.dropna(subset=['powiat_std']).copy()
+    df_woj_only = df[df['powiat_std'].isna() & df['wojewodztwo_std'].notna()].copy()
+
+    # --- 3. Calculate the base treatment matrix from data with known powiats ---
+    agg_dict = {col: 'sum' for col in financial_cols_with_numerator}
+    contract_col_name = 'Contracts number' if 'Contracts number' in df_with_powiat.columns else 'Contract number'
+    agg_dict[contract_col_name] = pd.Series.nunique
+    agg_dict['wojewodztwo'] = 'first'
+    agg_dict['powiat'] = 'first'
+    
+    # Group by standardized name but keep original names in columns
+    treatment_matrix = df_with_powiat.groupby('powiat_std').agg(agg_dict)
+    treatment_matrix.index.name = 'powiat_std' # Rename index for clarity
+
+    # --- 4. Calculate and distribute voivodeship-only funds ---
+    if not df_woj_only.empty:
+        # Also sum the rate_numerator for voivodeship-only funds
+        distributable_funds = df_woj_only.groupby('wojewodztwo')[financial_cols_with_numerator].sum()
+        distributable_funds['wojewodztwo_std'] = distributable_funds.index.to_series().apply(standardize_polish_name)
+
+        # Map the official powiat count to the distributable funds
+        distributable_funds['powiat_count'] = distributable_funds['wojewodztwo_std'].map(OFFICIAL_POWIAT_COUNT)
+
+        # Calculate the per-powiat share
+        for col in financial_cols_with_numerator:
+            distributable_funds[f'{col}_per_powiat'] = distributable_funds[col] / distributable_funds['powiat_count']
+
+        # --- 5. Add distributed funds to the main treatment matrix ---
+        # Standardize wojewodztwo name in the main matrix for joining
+        treatment_matrix['wojewodztwo_std'] = treatment_matrix['wojewodztwo'].apply(standardize_polish_name)
+        
+        # Merge the per-powiat shares into the main matrix
+        per_powiat_shares = distributable_funds.set_index('wojewodztwo_std')[[f'{c}_per_powiat' for c in financial_cols_with_numerator]]
+        treatment_matrix = treatment_matrix.merge(per_powiat_shares, on='wojewodztwo_std', how='left').fillna(0)
+
+        # Add the distributed share to the direct funding
+        for col in financial_cols_with_numerator:
+            treatment_matrix[col] += treatment_matrix[f'{col}_per_powiat']
+            treatment_matrix.drop(columns=[f'{col}_per_powiat'], inplace=True)
+        treatment_matrix.drop(columns=['wojewodztwo_std'], inplace=True)
+
+    # --- Final Cleanup ---
+    treatment_matrix.index.name = 'powiat_std'
+    treatment_matrix = treatment_matrix.rename(columns={contract_col_name: 'number_of_unique_projects'})
+
+    # Calculate the final weighted average co-financing rate
+    if 'rate_numerator' in treatment_matrix.columns and cofinancing_val_col in treatment_matrix.columns:
+        # Use .where to avoid division by zero
+        treatment_matrix[rate_col] = treatment_matrix['rate_numerator'] / treatment_matrix[cofinancing_val_col].where(treatment_matrix[cofinancing_val_col] != 0)
+        treatment_matrix.drop(columns=['rate_numerator'], inplace=True)
+
+    treatment_matrix = treatment_matrix.sort_values(
+        by='Amount of EU co-financing (PLN, for ETC projects EUR)',
+        ascending=False
+    )
+
+    return treatment_matrix
+
+
+def create_panel_treatment_matrix(cleaned_df: pd.DataFrame, start_date_col: str, end_date_col: str) -> pd.DataFrame:
+    """
+    Creates a panel treatment matrix, distributing project funds over time.
+
+    This function assumes funds are distributed evenly across each year of a project's duration.
+    It also handles the distribution of voivodeship-only funds to their constituent powiats on a per-year basis.
+
+    Args:
+        cleaned_df (pd.DataFrame): DataFrame after cleaning and location extraction.
+        start_date_col (str): The column name for project start dates.
+        end_date_col (str): The column name for project end dates.
+
+    Returns:
+        pd.DataFrame: A panel DataFrame indexed by 'powiat' and 'year', showing annual funding.
+    """
+    # --- 1. Setup and Data Preparation ---
+    df = cleaned_df.copy()
+    
+    # Ensure date columns are in datetime format
+    df[start_date_col] = pd.to_datetime(df[start_date_col], errors='coerce')
+    df[end_date_col] = pd.to_datetime(df[end_date_col], errors='coerce')
+
+    # Drop rows where dates are essential but missing
+    df.dropna(subset=[start_date_col, end_date_col], inplace=True)
+
+    # Extract year and calculate project duration
+    df['start_year'] = df[start_date_col].dt.year
+    df['end_year'] = df[end_date_col].dt.year
+    # Duration is number of years involved, e.g., 2020-2022 is 3 years.
+    df['duration_years'] = (df['end_year'] - df['start_year']) + 1
+    # Ensure duration is at least 1 to prevent division by zero
+    df['duration_years'] = df['duration_years'].apply(lambda x: max(x, 1))
+    
+    rate_col = 'Union co-financing rate (%)'
+
+    # --- 2. Calculate Annual Funding ---
+    financial_cols = [
+        'Total project value (PLN, for ETC projects EUR)',
+        'Total eligible expenditure (PLN, for ETC projects EUR)',
+        'Amount of EU co-financing (PLN, for ETC projects EUR)'
+    ]
+    cofinancing_val_col = 'Amount of EU co-financing (PLN, for ETC projects EUR)'
+
+    annual_financial_cols = []
+    for col in financial_cols:
+        annual_col = f"annual_{col}"
+        annual_financial_cols.append(annual_col)
+        # Distribute total funding evenly across the project's duration
+        df[annual_col] = df[col] / df['duration_years']
+
+    # --- Prepare for Weighted Average Calculation ---
+    if rate_col in df.columns and cofinancing_val_col in df.columns:
+        df[rate_col] = pd.to_numeric(df[rate_col], errors='coerce')
+        # This column will be the numerator for the weighted average
+        annual_cofinancing_val_col = f"annual_{cofinancing_val_col}"
+        df['rate_numerator'] = df[rate_col] * df[annual_cofinancing_val_col]
+
+    # --- 3. Expand DataFrame to Panel Format ---
+    # Create a new row for each year a project was active
+    panel_rows = []
+    for _, row in df.iterrows():
+        for year in range(int(row['start_year']), int(row['end_year']) + 1):
+            new_row = row.to_dict()
+            new_row['year'] = year
+            panel_rows.append(new_row)
+    
+    if not panel_rows:
+        return pd.DataFrame() # Return empty if no valid projects
+
+    panel_df = pd.DataFrame(panel_rows)
+
+    # --- 4. Aggregate by Powiat and Year (using logic from create_treatment_matrix) ---
+    # Standardize names for aggregation
+    panel_df['wojewodztwo_std'] = panel_df['wojewodztwo'].apply(standardize_polish_name)
+    panel_df['powiat_std'] = panel_df['powiat'].apply(standardize_polish_name)
+
+    # Separate data
+    df_with_powiat = panel_df.dropna(subset=['powiat_std'])
+    df_woj_only = panel_df[panel_df['powiat_std'].isna() & panel_df['wojewodztwo_std'].notna()]
+
+    # Aggregate direct funding
+    agg_dict = {col: 'sum' for col in annual_financial_cols}
+    agg_dict['wojewodztwo'] = 'first'
+    agg_dict['wojewodztwo_std'] = 'first'
+    # Add sum for the weighted average numerator
+    if 'rate_numerator' in df_with_powiat.columns:
+        agg_dict['rate_numerator'] = 'sum'
+
+    # Add aggregation for counting unique projects
+    contract_col_name = None
+    if 'Contract number' in df_with_powiat.columns:
+        contract_col_name = 'Contract number'
+    elif 'Contracts number' in df_with_powiat.columns:
+        contract_col_name = 'Contracts number'
+    
+    if contract_col_name:
+        agg_dict[contract_col_name] = pd.Series.nunique
+    
+    panel_matrix = df_with_powiat.groupby(['powiat_std', 'year']).agg(agg_dict)
+
+    # --- 5. Distribute Voivodeship-only Funds Annually ---
+    if not df_woj_only.empty:
+        # Sum distributable funds per wojewodztwo, per year
+        dist_funds_panel = df_woj_only.groupby(['wojewodztwo_std', 'year'])[annual_financial_cols].sum()
+        dist_funds_panel['powiat_count'] = dist_funds_panel.index.get_level_values('wojewodztwo_std').map(OFFICIAL_POWIAT_COUNT)
+
+        # Calculate per-powiat, per-year share
+        for col in annual_financial_cols:
+            # Use .get to avoid errors if a wojewodztwo is not in the count dictionary
+            dist_funds_panel[f'{col}_per_powiat'] = dist_funds_panel[col] / dist_funds_panel['powiat_count'].where(dist_funds_panel['powiat_count'] > 0)
+
+        # Merge distributed funds back to the main panel matrix
+        per_powiat_shares = dist_funds_panel[[f'{c}_per_powiat' for c in annual_financial_cols]]
+        
+        # FIX: Reset index before merge, then set it back after
+        panel_matrix_reset = panel_matrix.reset_index()
+        panel_matrix_merged = panel_matrix_reset.merge(per_powiat_shares, on=['wojewodztwo_std', 'year'], how='left')
+        
+        # Fill NaNs and add distributed share to direct funding
+        for col in annual_financial_cols:
+            share_col = f'{col}_per_powiat'
+            panel_matrix_merged[share_col] = panel_matrix_merged[share_col].fillna(0)
+            panel_matrix_merged[col] += panel_matrix_merged[share_col]
+            panel_matrix_merged.drop(columns=[share_col], inplace=True)
+        
+        # Restore the MultiIndex
+        panel_matrix = panel_matrix_merged.set_index(['powiat_std', 'year'])
+
+    # --- 6. Final Cleanup ---
+    panel_matrix.index.names = ['powiat', 'year']
+    if 'wojewodztwo_std' in panel_matrix.columns:
+        panel_matrix = panel_matrix.drop(columns=['wojewodztwo_std'])
+    
+    # Rename columns to remove 'annual_' prefix for clarity
+    final_col_names = {old: new for old, new in zip(annual_financial_cols, financial_cols)}
+    panel_matrix = panel_matrix.rename(columns=final_col_names)
+
+    # Calculate the final weighted average co-financing rate
+    if 'rate_numerator' in panel_matrix.columns and cofinancing_val_col in panel_matrix.columns:
+        # Use .where to avoid division by zero
+        panel_matrix[rate_col] = panel_matrix['rate_numerator'] / panel_matrix[cofinancing_val_col].where(panel_matrix[cofinancing_val_col] != 0)
+        panel_matrix.drop(columns=['rate_numerator'], inplace=True)
+
+    # Rename the project count column for clarity
+    if contract_col_name:
+        panel_matrix.rename(columns={contract_col_name: 'number_of_projects'}, inplace=True)
+
+    return panel_matrix.sort_index()
+
+
+def flatten_and_rename_panel(panel_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flattens a panel DataFrame by resetting its index and renames columns
+    to a standardized, snake_case format for easier analysis.
+
+    Args:
+        panel_df (pd.DataFrame): A DataFrame with a MultiIndex (e.g., from 
+                                create_panel_treatment_matrix).
+
+    Returns:
+        pd.DataFrame: A flattened DataFrame with cleaned column names.
+    """
+    if not isinstance(panel_df.index, pd.MultiIndex):
+        print("Warning: Input DataFrame does not have a MultiIndex. "
+            "Flattening may not be necessary.")
+
+    # --- 1. Flatten the DataFrame ---
+    # This converts the 'powiat' and 'year' index levels into columns.
+    flat_df = panel_df.reset_index()
+
+    # --- 2. Define column mapping ---
+    rename_map = {
+        'Total project value (PLN, for ETC projects EUR)': 'total_project_value',
+        'Total eligible expenditure (PLN, for ETC projects EUR)': 'total_eligible_expenditure',
+        'Amount of EU co-financing (PLN, for ETC projects EUR)': 'cofinancing_value',
+        'Union co-financing rate (%)': 'eu_cofinancing_rate',
+        'Project implemented under competitive or non-competitive procedure': 'is_competitive',
+        'Funding completed': 'is_completed',
+        'number_of_unique_projects': 'project_count'
+    }
+
+    # --- 3. Rename the columns ---
+    # The .rename() method will ignore any keys in the map that are not found in the DataFrame's columns.
+    renamed_df = flat_df.rename(columns=rename_map)
+
+    return renamed_df
