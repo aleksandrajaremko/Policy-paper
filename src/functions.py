@@ -271,7 +271,6 @@ def create_treatment_matrix(cleaned_df: pd.DataFrame, geo_level: str = 'powiat')
 
     # --- 2. Separate data into two groups ---
     df_with_powiat = df.dropna(subset=['powiat_std']).copy()
-    df_woj_only = df[df['powiat_std'].isna() & df['wojewodztwo_std'].notna()].copy()
 
     # --- 3. Calculate the base treatment matrix from data with known powiats ---
     agg_dict = {col: 'sum' for col in financial_cols_with_numerator}
@@ -283,33 +282,6 @@ def create_treatment_matrix(cleaned_df: pd.DataFrame, geo_level: str = 'powiat')
     # Group by standardized name but keep original names in columns
     treatment_matrix = df_with_powiat.groupby('powiat_std').agg(agg_dict)
     treatment_matrix.index.name = 'powiat_std' # Rename index for clarity
-
-    # --- 4. Calculate and distribute voivodeship-only funds ---
-    if not df_woj_only.empty:
-        # Also sum the rate_numerator for voivodeship-only funds
-        distributable_funds = df_woj_only.groupby('wojewodztwo')[financial_cols_with_numerator].sum()
-        distributable_funds['wojewodztwo_std'] = distributable_funds.index.to_series().apply(standardize_polish_name)
-
-        # Map the official powiat count to the distributable funds
-        distributable_funds['powiat_count'] = distributable_funds['wojewodztwo_std'].map(OFFICIAL_POWIAT_COUNT)
-
-        # Calculate the per-powiat share
-        for col in financial_cols_with_numerator:
-            distributable_funds[f'{col}_per_powiat'] = distributable_funds[col] / distributable_funds['powiat_count']
-
-        # --- 5. Add distributed funds to the main treatment matrix ---
-        # Standardize wojewodztwo name in the main matrix for joining
-        treatment_matrix['wojewodztwo_std'] = treatment_matrix['wojewodztwo'].apply(standardize_polish_name)
-        
-        # Merge the per-powiat shares into the main matrix
-        per_powiat_shares = distributable_funds.set_index('wojewodztwo_std')[[f'{c}_per_powiat' for c in financial_cols_with_numerator]]
-        treatment_matrix = treatment_matrix.merge(per_powiat_shares, on='wojewodztwo_std', how='left').fillna(0)
-
-        # Add the distributed share to the direct funding
-        for col in financial_cols_with_numerator:
-            treatment_matrix[col] += treatment_matrix[f'{col}_per_powiat']
-            treatment_matrix.drop(columns=[f'{col}_per_powiat'], inplace=True)
-        treatment_matrix.drop(columns=['wojewodztwo_std'], inplace=True)
 
     # --- Final Cleanup ---
     treatment_matrix.index.name = 'powiat_std'
@@ -329,7 +301,7 @@ def create_treatment_matrix(cleaned_df: pd.DataFrame, geo_level: str = 'powiat')
     return treatment_matrix
 
 
-def create_panel_treatment_matrix(cleaned_df: pd.DataFrame, start_date_col: str, end_date_col: str) -> pd.DataFrame:
+def create_panel_treatment_matrix(cleaned_df: pd.DataFrame, start_date_col: str, end_date_col: str, all_powiats_path: str) -> pd.DataFrame:
     """
     Creates a panel treatment matrix, distributing project funds over time.
 
@@ -340,6 +312,7 @@ def create_panel_treatment_matrix(cleaned_df: pd.DataFrame, start_date_col: str,
         cleaned_df (pd.DataFrame): DataFrame after cleaning and location extraction.
         start_date_col (str): The column name for project start dates.
         end_date_col (str): The column name for project end dates.
+        all_powiats_path (str): Path to the comprehensive CSV file of all powiats.
 
     Returns:
         pd.DataFrame: A panel DataFrame indexed by 'powiat' and 'year', showing annual funding.
@@ -406,12 +379,12 @@ def create_panel_treatment_matrix(cleaned_df: pd.DataFrame, start_date_col: str,
     panel_df['powiat_std'] = panel_df['powiat'].apply(standardize_polish_name)
 
     # Separate data
-    df_with_powiat = panel_df.dropna(subset=['powiat_std'])
-    df_woj_only = panel_df[panel_df['powiat_std'].isna() & panel_df['wojewodztwo_std'].notna()]
+    df_with_powiat = panel_df.dropna(subset=['powiat_std']).copy()
 
     # Aggregate direct funding
     agg_dict = {col: 'sum' for col in annual_financial_cols}
     agg_dict['wojewodztwo'] = 'first'
+    agg_dict['powiat'] = 'first' # Keep the original powiat name
     agg_dict['wojewodztwo_std'] = 'first'
     # Add sum for the weighted average numerator
     if 'rate_numerator' in df_with_powiat.columns:
@@ -427,38 +400,10 @@ def create_panel_treatment_matrix(cleaned_df: pd.DataFrame, start_date_col: str,
     if contract_col_name:
         agg_dict[contract_col_name] = pd.Series.nunique
     
-    panel_matrix = df_with_powiat.groupby(['powiat_std', 'year']).agg(agg_dict)
-
-    # --- 5. Distribute Voivodeship-only Funds Annually ---
-    if not df_woj_only.empty:
-        # Sum distributable funds per wojewodztwo, per year
-        dist_funds_panel = df_woj_only.groupby(['wojewodztwo_std', 'year'])[annual_financial_cols].sum()
-        dist_funds_panel['powiat_count'] = dist_funds_panel.index.get_level_values('wojewodztwo_std').map(OFFICIAL_POWIAT_COUNT)
-
-        # Calculate per-powiat, per-year share
-        for col in annual_financial_cols:
-            # Use .get to avoid errors if a wojewodztwo is not in the count dictionary
-            dist_funds_panel[f'{col}_per_powiat'] = dist_funds_panel[col] / dist_funds_panel['powiat_count'].where(dist_funds_panel['powiat_count'] > 0)
-
-        # Merge distributed funds back to the main panel matrix
-        per_powiat_shares = dist_funds_panel[[f'{c}_per_powiat' for c in annual_financial_cols]]
-        
-        # FIX: Reset index before merge, then set it back after
-        panel_matrix_reset = panel_matrix.reset_index()
-        panel_matrix_merged = panel_matrix_reset.merge(per_powiat_shares, on=['wojewodztwo_std', 'year'], how='left')
-        
-        # Fill NaNs and add distributed share to direct funding
-        for col in annual_financial_cols:
-            share_col = f'{col}_per_powiat'
-            panel_matrix_merged[share_col] = panel_matrix_merged[share_col].fillna(0)
-            panel_matrix_merged[col] += panel_matrix_merged[share_col]
-            panel_matrix_merged.drop(columns=[share_col], inplace=True)
-        
-        # Restore the MultiIndex
-        panel_matrix = panel_matrix_merged.set_index(['powiat_std', 'year'])
+    panel_matrix = df_with_powiat.groupby(['wojewodztwo_std', 'powiat_std', 'year']).agg(agg_dict)
 
     # --- 6. Final Cleanup ---
-    panel_matrix.index.names = ['powiat', 'year']
+    panel_matrix.index.names = ['wojewodztwo_std', 'powiat_std', 'year']
     if 'wojewodztwo_std' in panel_matrix.columns:
         panel_matrix = panel_matrix.drop(columns=['wojewodztwo_std'])
     
@@ -476,7 +421,53 @@ def create_panel_treatment_matrix(cleaned_df: pd.DataFrame, start_date_col: str,
     if contract_col_name:
         panel_matrix.rename(columns={contract_col_name: 'number_of_projects'}, inplace=True)
 
-    return panel_matrix.sort_index()
+    # --- 7. Expand to a complete, balanced panel ---
+    print("Expanding to a complete, balanced panel...")
+    try:
+        # Load the comprehensive list of all powiats from the user-provided path
+        all_powiats_df = pd.read_csv(all_powiats_path, delimiter=';', header=4)
+        # This assumes the name columns in your TERC file are 'NAZWA' and 'NAZWA_WOJ'. Adjust if different.
+        powiat_name_col = 'NAZWA' 
+        woj_name_col = 'NAZWA_WOJ'
+        if woj_name_col not in all_powiats_df.columns:
+            raise KeyError(f"The reference TERC file is missing a voivodeship name column. Expected '{woj_name_col}'.")
+
+        all_powiats_df['wojewodztwo_std'] = all_powiats_df[woj_name_col].apply(standardize_polish_name)
+        all_powiats_df['powiat_std'] = all_powiats_df[powiat_name_col].apply(standardize_polish_name)
+        
+        # Create a list of unique (wojewodztwo_std, powiat_std) tuples
+        all_powiats_tuples = all_powiats_df[['wojewodztwo_std', 'powiat_std']].drop_duplicates().to_records(index=False)
+        
+        print(f"Successfully loaded {len(all_powiats_tuples)} unique powiats from reference file.")
+    except Exception as e:
+        print(f"ERROR: Could not load or process the comprehensive powiats file at '{all_powiats_path}'.")
+        print(f"Details: {e}")
+        print("Returning the sparse panel instead.")
+        return panel_matrix.sort_index()
+
+    # Determine the full range of years from the data, handle case where panel_matrix is empty
+    if not panel_matrix.empty:
+        min_year = int(panel_matrix.index.get_level_values('year').min())
+        max_year = int(panel_matrix.index.get_level_values('year').max())
+        all_years = range(min_year, max_year + 1)
+    else: # If no projects, create an empty panel for a default year range
+        all_years = range(pd.Timestamp.now().year - 10, pd.Timestamp.now().year + 1)
+
+    # Create the complete MultiIndex
+    # Create a DataFrame with all combinations of powiats and years
+    all_combinations = pd.MultiIndex.from_product([all_powiats_tuples, all_years], names=['powiat_info', 'year']).to_frame(index=False)
+    all_combinations[['wojewodztwo_std', 'powiat_std']] = pd.DataFrame(all_combinations['powiat_info'].tolist(), index=all_combinations.index)
+    all_combinations = all_combinations.drop(columns='powiat_info').set_index(['wojewodztwo_std', 'powiat_std', 'year'])
+
+    # Join the actual funding data onto this complete grid
+    complete_panel = all_combinations.join(panel_matrix).fillna(0)
+
+    # For the new rows, fill the original 'powiat' name from a map
+    name_mapper = all_powiats_df[['wojewodztwo_std', 'powiat_std', woj_name_col, powiat_name_col]].drop_duplicates(subset=['wojewodztwo_std', 'powiat_std'])
+    complete_panel = complete_panel.reset_index().merge(name_mapper, on=['wojewodztwo_std', 'powiat_std'], how='left').set_index(['wojewodztwo_std', 'powiat_std', 'year'])
+    complete_panel.rename(columns={woj_name_col: 'wojewodztwo', powiat_name_col: 'powiat'}, inplace=True)
+
+    return complete_panel.sort_index()
 
 
 def flatten_and_rename_panel(panel_df: pd.DataFrame) -> pd.DataFrame:
