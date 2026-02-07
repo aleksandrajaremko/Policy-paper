@@ -12,6 +12,8 @@ import re
 import geopandas as gpd                        
 import os
 from functools import lru_cache
+import pickle
+
 
 ############################################
 ############################################
@@ -65,6 +67,26 @@ rename_dict = {
                 "Data zakończenia realizacji" : "end_date"
 }
 
+# Define consistent dtypes
+data_types = {
+        "ID": str,
+        "program": str,
+        "priority_code": str,
+        "action_code": str,
+        "subaction_code": str,
+        "voviodeship": str,
+        "powiat": str,
+        "gmina": str,
+        "beneficiary_ID": str,
+        "beneficiary_postal_code": str,
+        "beneficiary_city": str,
+        "beneficiary_voviodeship": str,
+        "beneficiary_powiat": str,
+        "priority_theme": str,
+        "beneficiary_status": str,
+        "terriority_type": str,
+        "project_completed": str
+}
 ############################################
 ############################################
 # --- 0. READ AND PARSE DATETIME CSV FUNCTION ---
@@ -91,31 +113,11 @@ def read_and_parse(
     # Full path to the file
     full_path = os.path.join(file_path, f"{file_name}.csv")
     
-    # Define consistent dtypes
-    dtypes = {
-        "ID": str,
-        "program": str,
-        "priority_code": str,
-        "action_code": str,
-        "subaction_code": str,
-        "voviodeship": str,
-        "powiat": str,
-        "gmina": str,
-        "beneficiary_ID": str,
-        "beneficiary_postal_code": str,
-        "beneficiary_city": str,
-        "beneficiary_voviodeship": str,
-        "beneficiary_powiat": str,
-        "priority_theme": str,
-        "beneficiary_status": str,
-        "terriority_type": str,
-        "project_completed": str
-    }
     
     # Read the CSV
     df = pd.read_csv(
         full_path, 
-        dtype=dtypes, 
+        dtype=data_types, 
         parse_dates=date_cols,
         low_memory=False
     )
@@ -262,229 +264,62 @@ def distribute_funding_over_time(df, cols_to_distribute=None):
 #################################################
 #################################################
 
-# def build_teryt_lookups(
-#     path_excel = r"C:\Users\jarem\OneDrive - London School of Economics\YEAR 2\1. Policy paper\policy-paper-repo\data\inputs\shapefiles\polska\teryt_klucz_powiaty_gminy_lata_1999_2025-1.xlsx"
-#     ):
-#     # Load Data
-#     df_g = pd.read_excel(path_excel, sheet_name='gminy', dtype=str)
+# 1. LOAD THE MAPS (Instant)
+PICKLE_PATH = r"C:\Users\jarem\OneDrive - London School of Economics\YEAR 2\1. Policy paper\policy-paper-repo\data\outputs\teryt_lookup\teryt_lookup_2025.pkl"
+
+with open(PICKLE_PATH, 'rb') as f:
+    primary_map, fallback_map = pickle.load(f)
+
+# 2. DEFINE HELPER (Must match the notebook logic)
+def norm_text(s):
+    if pd.isna(s): return ""
+    s = str(s).lower()
+    s = re.sub(r'\s+od\s+\d{4}', '', s) # Removes ' od 2002'
+    for pat in ['m.st.', 'm.', 'st.', 'miasto', 'powiat', '-', '.', ' ']:
+        s = s.replace(pat, '')
+    return s
+
+# 3. THE ASSIGNMENT FUNCTION
+def assign_geo_ids(df):
     
-#     primary_lookup = {}
-#     fallback_candidates = {} 
+    voiv_map = {
+        'DOLNOŚLĄSKIE': '02', 'KUJAWSKO-POMORSKIE': '04', 'LUBELSKIE': '06', 
+        'LUBUSKIE': '08', 'ŁÓDZKIE': '10', 'MAŁOPOLSKIE': '12', 
+        'MAZOWIECKIE': '14', 'OPOLSKIE': '16', 'PODKARPACKIE': '18', 
+        'PODLASKIE': '20', 'POMORSKIE': '22', 'ŚLĄSKIE': '24', 
+        'ŚWIĘTOKRZYSKIE': '26', 'WARMIŃSKO-MAZURSKIE': '28', 
+        'WIELKOPOLSKIE': '30', 'ZACHODNIOPOMORSKIE': '32'
+    }
 
-#     # Define Norm Function INSIDE builder and return it, or define it globally
-#     def norm(s):
-#         if pd.isna(s): return ""
-#         s = str(s).lower()
-#         s = re.sub(r'\s+od\s+\d{4}', '', s) 
-#         s = s.replace('m.st.', '').replace('m.', '').replace('st.', '')
-#         s = s.replace('miasto', '').replace('powiat', '')
-#         s = s.replace('-', '').replace('.', '').replace(' ', '')
-#         return s
+    def get_ids_row(row):
+        # A. Resolve Voivodeship
+        v_name = str(row.get('voviodeship', '')).upper()
+        woj_id = voiv_map.get(v_name)
+        if not woj_id: return pd.Series([None, None, None, None])
 
-#     for _, row in df_g.iterrows():
-#         woj_id = str(row['region']).split('.')[0].zfill(2)
-#         pow_norm = norm(row['nazwa_powiatu'])
-#         gmi_norm = norm(row['nazwa_gminy'])
-#         target_id = str(row['teryt_2025']).split('.')[0].zfill(7)
+        # B. Normalize Inputs
+        p_raw = row.get('powiat', '')
+        g_raw = row.get('gmina', '')
         
-#         # 1. Primary Map
-#         primary_lookup[(woj_id, pow_norm, gmi_norm)] = target_id
-        
-#         # 2. Fallback Candidate
-#         fb_key = (woj_id, gmi_norm)
-#         if fb_key not in fallback_candidates: fallback_candidates[fb_key] = []
-#         fallback_candidates[fb_key].append(target_id)
-        
-#         # 3. Historical
-#         desc = str(row.get('zmiana_opis', ''))
-#         if 'zmiana nazwy z' in desc:
-#             match = re.search(r'zmiana nazwy z\s+(.+?)\s+na', desc, re.IGNORECASE)
-#             if match:
-#                 old_name = norm(match.group(1))
-#                 primary_lookup[(woj_id, pow_norm, old_name)] = target_id
-#                 fb_key_hist = (woj_id, old_name)
-#                 if fb_key_hist not in fallback_candidates: fallback_candidates[fb_key_hist] = []
-#                 fallback_candidates[fb_key_hist].append(target_id)
+        # Stop if no gmina
+        if pd.isna(g_raw) or str(g_raw).strip() == '':
+             return pd.Series([woj_id, None, None, None])
 
-#     # Filter Fallback to unique only
-#     fallback_lookup = {k: v[0] for k, v in fallback_candidates.items() if len(set(v)) == 1}
+        p_norm = norm_text(p_raw)
+        g_norm = norm_text(g_raw)
+        
+        # C. Lookup (Primary -> Fallback)
+        teryt7 = primary_map.get((woj_id, p_norm, g_norm))
+        
+        if not teryt7:
+            teryt7 = fallback_map.get((woj_id, g_norm))
             
-#     # Return the maps AND the normalization function to be used later
-#     return primary_lookup, fallback_lookup, norm
+        # D. Return
+        if teryt7:
+            return pd.Series([woj_id, teryt7[:4], teryt7, teryt7]) # Woj, Pow, Gmi, City
+        else:
+            return pd.Series([woj_id, None, None, None])
 
-# # --- CONFIGURATION ---
-# # Set your default path here so you don't have to type it every time
-# DEFAULT_TERYT_PATH = r"C:\Users\jarem\OneDrive - London School of Economics\YEAR 2\1. Policy paper\policy-paper-repo\data\inputs\shapefiles\polska\teryt_klucz_powiaty_gminy_lata_1999_2025-1.xlsx"
-
-# # --- 1. THE BUILDER (With Caching) ---
-# # @lru_cache(maxsize=1)
-# def build_teryt_lookups(path_excel):
-#     """
-#     Reads TERYT Excel and builds lookup maps.
-#     Cached: Subsequent calls with the same path are instant.
-#     """
-#     print(f"Loading TERYT data from: {path_excel}...")
-    
-#     # Load Data
-#     try:
-#         df_g = pd.read_excel(path_excel, sheet_name='gminy', dtype=str)
-#     except FileNotFoundError:
-#         raise FileNotFoundError(f"Could not find TERYT file at: {path_excel}")
-    
-#     primary_lookup = {}
-#     fallback_candidates = {}
-
-#     # Define Norm Function
-#     def norm(s):
-#         if pd.isna(s): return ""
-#         s = str(s).lower()
-#         # Specific TERYT fixes
-#         s = re.sub(r'\s+od\s+\d{4}', '', s) # Remove ' od 2002'
-#         s = s.replace('m.st.', '').replace('m.', '').replace('st.', '')
-#         s = s.replace('miasto', '').replace('powiat', '')
-#         s = s.replace('-', '').replace('.', '').replace(' ', '')
-#         return s
-
-#     for _, row in df_g.iterrows():
-#         woj_id = str(row['region']).split('.')[0].zfill(2)
-#         pow_norm = norm(row['nazwa_powiatu'])
-#         gmi_norm = norm(row['nazwa_gminy'])
-#         target_id = str(row['teryt_2025']).split('.')[0].zfill(7)
-        
-#         # 1. Primary Map
-#         primary_lookup[(woj_id, pow_norm, gmi_norm)] = target_id
-        
-#         # 2. Fallback Candidates
-#         fb_key = (woj_id, gmi_norm)
-#         if fb_key not in fallback_candidates: fallback_candidates[fb_key] = []
-#         fallback_candidates[fb_key].append(target_id)
-        
-#         # 3. Historical Names
-#         desc = str(row.get('zmiana_opis', ''))
-#         if 'zmiana nazwy z' in desc:
-#             match = re.search(r'zmiana nazwy z\s+(.+?)\s+na', desc, re.IGNORECASE)
-#             if match:
-#                 old_name = norm(match.group(1))
-#                 primary_lookup[(woj_id, pow_norm, old_name)] = target_id
-                
-#                 fb_key_hist = (woj_id, old_name)
-#                 if fb_key_hist not in fallback_candidates: fallback_candidates[fb_key_hist] = []
-#                 fallback_candidates[fb_key_hist].append(target_id)
-
-#     # Filter Fallback to Unique Only
-#     fallback_lookup = {k: v[0] for k, v in fallback_candidates.items() if len(set(v)) == 1}
-    
-#     print("TERYT Lookup built successfully.")
-#     return primary_lookup, fallback_lookup, norm
-
-
-# # --- 2. THE ASSIGNER (Smart Wrapper) ---
-# def assign_geo_ids(df, lookup_tuple=None, path_excel=DEFAULT_TERYT_PATH):
-#     """
-#     Assigns TERYT IDs to the dataframe.
-    
-#     Parameters:
-#     - df: The dataframe to process.
-#     - lookup_tuple: (Optional) The output of build_teryt_lookup_advanced.
-#     - path_excel: (Optional) Path to the Excel file if lookup_tuple is missing.
-#       Defaults to the DEFAULT_TERYT_PATH constant.
-#     """
-    
-#     # 1. Auto-build lookup if not provided
-#     if lookup_tuple is None:
-#         lookup_tuple = build_teryt_lookups(path_excel)
-        
-#     primary_map, fallback_map, norm_func = lookup_tuple
-    
-#     # 2. Hardcoded Voivodeship Map
-#     voiv_map = {
-#         'DOLNOŚLĄSKIE': '02', 'KUJAWSKO-POMORSKIE': '04', 'LUBELSKIE': '06', 
-#         'LUBUSKIE': '08', 'ŁÓDZKIE': '10', 'MAŁOPOLSKIE': '12', 
-#         'MAZOWIECKIE': '14', 'OPOLSKIE': '16', 'PODKARPACKIE': '18', 
-#         'PODLASKIE': '20', 'POMORSKIE': '22', 'ŚLĄSKIE': '24', 
-#         'ŚWIĘTOKRZYSKIE': '26', 'WARMIŃSKO-MAZURSKIE': '28', 
-#         'WIELKOPOLSKIE': '30', 'ZACHODNIOPOMORSKIE': '32'
-#     }
-    
-#     # 3. Apply Logic
-#     def get_ids_row(row):
-#         v_name = str(row.get('voviodeship', '')).upper()
-#         woj_id = voiv_map.get(v_name)
-#         if not woj_id: return pd.Series([None, None, None, None])
-
-#         p_raw = row.get('powiat', '')
-#         g_raw = row.get('gmina', '')
-        
-#         if pd.isna(g_raw) or str(g_raw).strip() == '':
-#              return pd.Series([woj_id, None, None, None])
-
-#         p_norm = norm_func(p_raw)
-#         g_norm = norm_func(g_raw)
-        
-#         # Try Primary
-#         teryt7 = primary_map.get((woj_id, p_norm, g_norm))
-#         # Try Fallback
-#         if not teryt7:
-#             teryt7 = fallback_map.get((woj_id, g_norm))
-            
-#         if teryt7:
-#             teryt4 = teryt7[:4]
-#             return pd.Series([woj_id, teryt4, teryt7, teryt7])
-#         else:
-#             return pd.Series([woj_id, None, None, None])
-
-#     # Assign columns
-#     df[['voivodeship_id', 'powiat_id', 'gmina_id', 'city_id']] = df.apply(get_ids_row, axis=1)
-    
-#     return df
-
-
-# ############################################
-# ############################################
-# # --- 4. SPATIAL DISAGGREGATION FUNCTION ---
-# ############################################
-# ############################################
-
-# def disaggregate_powiat_funding(df, teryt_map):
-#     """
-#     Step 3: Splits Powiat-only funding equally among constituent Gminas.
-#     teryt_map: Dict { 'normalized_powiat_name': ['Gmina A', 'Gmina B'] }
-#     """
-#     def norm_key(s):
-#         return str(s).lower().replace('powiat', '').replace(' ', '').replace('.', '').replace('-', '')
-
-#     # Identify rows needing split
-#     mask_split = df['gmina'].isnull() & df['powiat'].notnull()
-    
-#     df_ready = df[~mask_split].copy()
-#     df_to_split = df[mask_split].copy()
-    
-#     disaggregated_rows = []
-    
-#     if not df_to_split.empty:
-#         df_to_split['powiat_key'] = df_to_split['powiat'].apply(norm_key)
-        
-#         for p_key, group in df_to_split.groupby('powiat_key'):
-#             gminas = teryt_map.get(p_key, [])
-            
-#             if gminas:
-#                 count = len(gminas)
-#                 group['EU_subsidy_PLN'] /= count
-                
-#                 # Replicate rows
-#                 group_repeated = group.loc[group.index.repeat(count)].copy()
-#                 group_repeated['gmina'] = gminas * len(group)
-                
-#                 disaggregated_rows.append(group_repeated)
-#             else:
-#                 # Keep unmapped powiats
-#                 group['gmina'] = 'Unknown/Unmapped'
-#                 disaggregated_rows.append(group)
-    
-#     if disaggregated_rows:
-#         return pd.concat([df_ready, pd.concat(disaggregated_rows)], ignore_index=True)
-    
-#     return df_ready
-
-
-
+    # Apply
+    df[['voivodeship_id', 'powiat_id', 'gmina_id', 'city_id']] = df.apply(get_ids_row, axis=1)
+    return df
