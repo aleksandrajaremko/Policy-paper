@@ -323,3 +323,206 @@ def assign_geo_ids(df):
     # Apply
     df[['voivodeship_id', 'powiat_id', 'gmina_id', 'city_id']] = df.apply(get_ids_row, axis=1)
     return df
+
+
+def aggregate_funding_by_gmina(df):
+    """
+    Aggregates project-level data to Gmina-Year level.
+    Sums financial columns and keeps geographical identifiers.
+    """
+    # 1. Define columns to Group By
+    # We group by ID to be precise, but also keep the names for readability.
+    # Note: We include 'voivodeship_id' and 'powiat_id' to maintain hierarchy.
+    group_cols = ['voivodeship_id', 'powiat_id', 'gmina_id', 'Year']
+    
+    # 2. Define Financial Columns to Sum
+    # Add any other financial columns you have in your dataset
+    fin_cols = [
+        'EU_subsidy_PLN', 
+        'total_value_PLN', 
+        'subsidy_PLN', 
+        'eligible_expenses_PLN'
+    ]
+    # Filter to only use columns that actually exist in your dataframe
+    existing_fin_cols = [c for c in fin_cols if c in df.columns]
+    
+    # 3. Define Aggregation Logic
+    # Sum financial data, take the 'first' name found for the location
+    agg_dict = {col: 'sum' for col in existing_fin_cols}
+    
+    # Keep human-readable names (Optional but recommended)
+    for name_col in ['voviodeship', 'powiat', 'gmina']:
+        if name_col in df.columns:
+            agg_dict[name_col] = 'first'
+            
+    # 4. Perform Aggregation
+    # We drop rows where gmina_id is NaN (e.g. projects assigned to "Whole Voivodeship")
+    # If you want to keep them, remove the dropna() line.
+    df_clean = df.dropna(subset=['gmina_id'])
+    
+    df_gmina_level = df_clean.groupby(group_cols, as_index=False).agg(agg_dict)
+    
+    # 5. Sort for clean panel structure
+    df_gmina_level = df_gmina_level.sort_values(by=['gmina_id', 'Year'])
+    
+    return df_gmina_level
+
+
+
+
+
+##############################################
+##############################################
+# --- 5. SPATIAL DISAGGREGATION FUNCTION ---
+##############################################
+##############################################
+
+def disaggregate_powiat_funding(df, path_to_pickle):
+    """
+    Implements OPTION B:
+    If Gmina ID is missing but Powiat ID exists, split the funding 
+    equally among all Gminas in that Powiat.
+    """
+    # 1. Load the Hierarchy Map
+    with open(path_to_pickle, 'rb') as f:
+        powiat_structure = pickle.load(f)
+        
+    # 2. Identify Rows to Split
+    # Condition: Gmina is NaN/Empty AND Powiat is Valid
+    mask_split = (df['gmina_id'].isna() | (df['gmina_id'] == '')) & (df['powiat_id'].notna())
+    
+    df_clean = df[~mask_split].copy()
+    df_dirty = df[mask_split].copy()
+    
+    if df_dirty.empty:
+        print("No Powiat-only rows found. Returning original.")
+        return df_clean
+
+    print(f"Disaggregating {len(df_dirty)} powiat-level rows...")
+
+    # 3. Map Powiats to List of Gminas
+    # We create a temporary column 'target_gminas' containing the list [0201011, 0201022...]
+    # We lookup using a tuple index (woj_id, powiat_id)
+    df_dirty['lookup_key'] = list(zip(df_dirty['voivodeship_id'], df_dirty['powiat_id']))
+    df_dirty['target_gminas'] = df_dirty['lookup_key'].map(powiat_structure)
+    
+    # Filter out rows where map failed (orphaned codes) - rare but possible
+    df_valid_split = df_dirty.dropna(subset=['target_gminas']).copy()
+    
+    # 4. Calculate Split Factor
+    # If a powiat has 5 gminas, divisor is 5.
+    df_valid_split['divisor'] = df_valid_split['target_gminas'].apply(len)
+    
+    # 5. Divide Financial Columns
+    # List all money columns you want to split
+    fin_cols = [c for c in ['EU_subsidy_PLN', 'total_value_PLN', 'subsidy_PLN', 'eligible_expenses_PLN'] if c in df.columns]
+    
+    for col in fin_cols:
+        # Divide value by number of gminas
+        df_valid_split[col] = df_valid_split[col] / df_valid_split['divisor']
+        
+    # 6. Explode (The Magic Step)
+    # This turns 1 row with a list of 5 gminas into 5 rows, copying all other data
+    df_exploded = df_valid_split.explode('target_gminas')
+    
+    # 7. Final Cleanup
+    df_exploded['gmina_id'] = df_exploded['target_gminas']
+    
+    # Keep columns consistent with original df
+    cols_to_keep = df.columns.tolist()
+    df_final_split = df_exploded[cols_to_keep]
+    
+    # 8. Recombine with the clean data
+    df_result = pd.concat([df_clean, df_final_split], ignore_index=True)
+    
+    print(f"Result: Expanded to {len(df_result)} rows (added {len(df_result) - len(df)} generated rows).")
+    
+    return df_result
+
+
+
+
+
+###################################################################
+###################################################################
+########################## 2014- 2020##############################
+
+def parse_and_explode_locations(df):
+    """
+    Parses 'project_place' column:
+    1. Splits multiple locations (separated by '|')
+    2. Extracts Voivodeship and Powiat
+    3. Explodes rows (one row per location)
+    4. Divides financial values by the number of locations
+    """
+    # Work on a copy
+    df = df.copy()
+    
+    # 1. Parsing Logic
+    def extract_locs(place_str):
+        if pd.isna(place_str) or place_str == '':
+            return []
+        
+        # Handle "Cały Kraj" explicitly
+        if 'Cały Kraj' in place_str:
+            return [{'voivodeship_raw': 'Cały Kraj', 'powiat_raw': None}]
+
+        # Split by pipe '|'
+        entries = place_str.split('|')
+        parsed_entries = []
+        
+        for entry in entries:
+            entry = entry.strip()
+            # Regex to capture WOJ and optional POW
+            # Pattern: Look for "WOJ.:" then content, then optional ", POW.:" then content
+            match = re.search(r'WOJ\.:\s*(?P<woj>[^,]*)(?:,\s*POW\.:\s*(?P<pow>.*))?', entry, re.IGNORECASE)
+            
+            if match:
+                w = match.group('woj').strip()
+                p = match.group('pow')
+                if p: p = p.strip()
+                
+                parsed_entries.append({'voivodeship_raw': w, 'powiat_raw': p})
+            else:
+                # Fallback if format is weird
+                parsed_entries.append({'voivodeship_raw': entry, 'powiat_raw': None})
+                
+        return parsed_entries
+
+    # Apply extraction -> Creates a column of lists
+    df['parsed_locs'] = df['project_place'].apply(extract_locs)
+    
+    # 2. Calculate Split Factor (How many locations per project?)
+    df['location_count'] = df['parsed_locs'].apply(len)
+    
+    # Avoid division by zero (if location was empty)
+    df['location_count'] = df['location_count'].replace(0, 1)
+    
+    # 3. Split Financials
+    # List of money columns to divide
+    fin_cols = [c for c in ['total_value_PLN', 'eu_fund'] if c in df.columns]
+    
+    for col in fin_cols:
+        # Convert to numeric just in case
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        df[col] = df[col] / df['location_count']
+
+    # 4. Explode
+    # This turns 1 row into N rows
+    df_exploded = df.explode('parsed_locs')
+    
+    # 5. Extract Dict keys to columns
+    # Safe way to unpack the dictionaries into columns
+    loc_data = df_exploded['parsed_locs'].apply(pd.Series)
+    
+    # Merge back
+    df_final = pd.concat([df_exploded.drop(['parsed_locs'], axis=1), loc_data], axis=1)
+    
+    # 6. Renaming for compatibility with your existing Assign ID function
+    # Your assign_geo_ids expects 'voviodeship' and 'powiat'
+    df_final = df_final.rename(columns={
+        'voivodeship_raw': 'voviodeship', 
+        'powiat_raw': 'powiat'
+    })
+    
+    return df_final
